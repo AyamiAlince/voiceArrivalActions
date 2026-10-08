@@ -1,4 +1,4 @@
-// Run with Node 22.6+: node voiceArrivalActions/check.cjs
+// Run with Node 22.13+ from the plugin folder: node check.cjs
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
@@ -11,6 +11,8 @@ let selected = "source";
 let ids = ["me"];
 let admin = true;
 let reject = false;
+let rateLimits = 0;
+const toasts = [];
 const patches = [];
 const selections = [];
 const rules = [{ guildId: "111111111111111111", userId: "222222222222222222", action: "disconnect" }];
@@ -29,7 +31,8 @@ const context = vm.createContext({
         }), use: () => values };
     },
     React: { createElement: (type, props) => ({ type, props }) }, UserAreaButton: "button", RulesEditor() {},
-    OptionType: { STRING: 1 }, Logger: class { error() {} },
+    OptionType: { BOOLEAN: 3, COMPONENT: 6 }, Logger: class { error() {} },
+    sleep: () => Promise.resolve(), classNameFactory: prefix => name => prefix + name,
     VoiceStateStore: {
         getVoiceStatesForChannel: () => Object.fromEntries(ids.map(userId => [userId, { userId }])),
         addChangeListener: f => listeners.add(f), removeChangeListener: f => listeners.delete(f)
@@ -39,16 +42,22 @@ const context = vm.createContext({
     ChannelStore: { getChannel: id => ({ id, guild_id: rules[0].guildId, type: 2 }) },
     ChannelActions: { selectVoiceChannel: id => { selections.push(id); selected = id; } },
     PermissionStore: { can: () => admin },
-    PermissionsBits: { ADMINISTRATOR: 8n, VIEW_CHANNEL: 1024n, CONNECT: 1048576n },
-    RestAPI: { patch: async request => { if (reject) throw Error("403"); patches.push(request); } },
-    showToast() {}, Toasts: { Type: { FAILURE: "failure", MESSAGE: "message" } }
+    PermissionsBits: { VIEW_CHANNEL: 1024n, CONNECT: 1048576n, MOVE_MEMBERS: 16777216n },
+    RestAPI: {
+        patch: async request => {
+            if (rateLimits > 0) { rateLimits--; throw { status: 429, body: { retry_after: 0 } }; }
+            if (reject) throw Error("403");
+            patches.push(request);
+        }
+    },
+    showToast: (message, type) => toasts.push(type)
 });
 vm.runInContext(stripTypeScriptTypes(source), context);
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
 function change(next) { ids = next; listeners.forEach(f => f()); }
 function reset(action, occupants = ["me", "other"]) {
     context.plugin.stop();
-    selected = "source"; ids = occupants; admin = true; reject = false;
+    selected = "source"; ids = occupants; admin = true; reject = false; rateLimits = 0;
     patches.length = selections.length = 0;
     context.plugin.settings.store.rules = JSON.stringify([{ ...rules[0], action, channelId: "333333333333333333" }]);
     context.plugin.start();
@@ -104,6 +113,11 @@ function reset(action, occupants = ["me", "other"]) {
     assert.deepEqual(selections, [null]);
     assert.throws(() => context.parseRules(JSON.stringify([{ ...rules[0], guildId: "*", action: "move", channelId: "333333333333333333" }])));
     reset("leave");
+    context.plugin.stop();
+    reset("disconnect"); rateLimits = 2; change(["me", "other", target]); await tick();
+    assert.equal(patches.length, 1, "Rate limited requests are retried");
+    assert.deepEqual(selections, [null]);
+    assert.ok(toasts.length && toasts.every(type => type === "message" || type === "failure"), "Toasts use Discord's string types");
     context.plugin.stop();
     console.log("Global rule checks passed: matching, actual server routing, overrides and destination validation.");
     checkEditor();
