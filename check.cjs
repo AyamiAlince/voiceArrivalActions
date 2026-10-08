@@ -106,7 +106,11 @@ function checkEditor() {
     const editorSource = fs.readFileSync(`${__dirname}/rulesEditor.ts`, "utf8")
         .replace(/^import .*;\r?\n/gm, "")
         .replace("export function RulesEditor", "function RulesEditor");
-    vm.runInContext(stripTypeScriptTypes(editorSource), context);
+    const readyReact = context.React;
+    context.React = undefined;
+    assert.doesNotThrow(() => vm.runInContext(stripTypeScriptTypes(editorSource), context),
+        "Editor import must not access React before Discord initializes it");
+    context.React = readyReact;
     const saved = context.plugin.settings.store.rules;
     const render = () => { cursor = 0; return context.RulesEditor(); };
     function flatten(node) {

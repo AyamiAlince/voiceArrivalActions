@@ -4,7 +4,6 @@ import type { ChangeEvent, CSSProperties, ReactNode } from "react";
 
 import { parseRules, Rule, settings } from ".";
 
-const h = React.createElement;
 const controlStyle: CSSProperties = {
     width: "100%", boxSizing: "border-box", padding: "8px", borderRadius: "4px",
     background: "var(--input-background, var(--background-secondary))",
@@ -13,12 +12,14 @@ const controlStyle: CSSProperties = {
 const stack: CSSProperties = { display: "flex", flexDirection: "column", gap: "12px" };
 
 function field(title: string, child: ReactNode) {
+    const h = React.createElement;
     return h("label", { style: { ...stack, gap: "4px" } }, h("span", null, title), child);
 }
 
 function RuleCard({ rule, index, update, remove }: {
     rule: Rule; index: number; update: (next: Rule) => void; remove: () => void;
 }) {
+    const h = React.createElement;
     const listId = React.useId();
     const guilds = useStateFromStores([GuildStore], () => Object.values(GuildStore.getGuilds())
         .sort((a, b) => a.name.localeCompare(b.name)));
@@ -61,6 +62,8 @@ function RuleCard({ rule, index, update, remove }: {
 }
 
 export function RulesEditor() {
+    // Discord's React export is only available after webpack initialization.
+    const h = React.createElement;
     const { rules: saved } = settings.use(["rules"]);
     const [draft, setDraft] = React.useState<Rule[]>(() => {
         try { return parseRules(saved); } catch { return []; }
