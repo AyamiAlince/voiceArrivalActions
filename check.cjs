@@ -89,6 +89,23 @@ function reset(action, occupants = ["me", "other"]) {
     assert.equal(patches.length + selections.length, 0);
     context.plugin.stop();
     console.log("10 voice action scenarios passed, including the toggle button and cancellation.");
+    reset("leave");
+    context.plugin.settings.store.rules = JSON.stringify([{ ...rules[0], guildId: "*", action: "disconnect" }]);
+    change(["me", "other", target]); await tick();
+    assert.equal(patches.length, 1);
+    assert.ok(patches[0].url.includes(`/guilds/${rules[0].guildId}/`), "Global actions use the actual source server");
+    reset("leave");
+    context.plugin.settings.store.rules = JSON.stringify([
+        { ...rules[0], guildId: "*", action: "disconnect" },
+        { ...rules[0], action: "leave" }
+    ]);
+    change(["me", "other", target]); await tick();
+    assert.equal(patches.length, 0, "Server rule overrides global action");
+    assert.deepEqual(selections, [null]);
+    assert.throws(() => context.parseRules(JSON.stringify([{ ...rules[0], guildId: "*", action: "move", channelId: "333333333333333333" }])));
+    reset("leave");
+    context.plugin.stop();
+    console.log("Global rule checks passed: matching, actual server routing, overrides and destination validation.");
     checkEditor();
 })().catch(error => { console.error(error); process.exitCode = 1; });
 

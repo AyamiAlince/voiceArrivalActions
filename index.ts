@@ -27,12 +27,14 @@ export function parseRules(text: string): Rule[] {
     const seen = new Set<string>();
     for (const rule of rules) {
         if (!rule || typeof rule !== "object"
-            || typeof rule.guildId !== "string" || !snowflake.test(rule.guildId)
+            || typeof rule.guildId !== "string" || (rule.guildId !== "*" && !snowflake.test(rule.guildId))
             || typeof rule.userId !== "string" || !snowflake.test(rule.userId)
             || !["leave", "disconnect", "move"].includes(rule.action))
             throw new Error("Choose a server, enter a valid user ID and select an action for every rule.");
         if (rule.action === "move" && (typeof rule.channelId !== "string" || !snowflake.test(rule.channelId)))
             throw new Error("Choose a destination voice channel for every move rule.");
+        if (rule.guildId === "*" && rule.action === "move")
+            throw new Error("Use a server-specific rule for moving members. All servers supports leaving or disconnecting.");
         const key = `${rule.guildId}:${rule.userId}`;
         if (seen.has(key)) throw new Error("Only one rule per user per server is allowed.");
         seen.add(key);
@@ -92,7 +94,7 @@ async function act(rule: Rule, sourceId: string, targets: string[], token: numbe
         && members(sourceId).has(rule.userId);
     if (!me || !stillValid()) return;
     const source = ChannelStore.getChannel(sourceId);
-    if (!source || source.guild_id !== rule.guildId) return;
+    if (!source || !source.guild_id || (rule.guildId !== "*" && source.guild_id !== rule.guildId)) return;
 
     if (rule.action === "leave") {
         ChannelActions.selectVoiceChannel(null);
@@ -127,7 +129,7 @@ async function act(rule: Rule, sourceId: string, targets: string[], token: numbe
         }
         try {
             await RestAPI.patch({
-                url: `/guilds/${rule.guildId}/members/${id}`,
+                url: `/guilds/${source.guild_id}/members/${id}`,
                 body: { channel_id: rule.action === "move" ? rule.channelId : null }
             });
             completed++;
@@ -163,8 +165,10 @@ function onVoiceChange() {
     let rules: Rule[];
     try { rules = parseRules(settings.store.rules); }
     catch (error) { logger.error("Invalid rules", error); return; }
-    const rule = rules.find(r => r.guildId === source.guild_id && r.userId !== me
-        && current.has(r.userId) && !before.has(r.userId));
+    const matchesArrival = (r: Rule) => r.userId !== me && current.has(r.userId) && !before.has(r.userId);
+    // A server-specific rule overrides the global rule for the same user.
+    const rule = rules.find(r => r.guildId === source.guild_id && matchesArrival(r))
+        ?? rules.find(r => r.guildId === "*" && matchesArrival(r));
     if (!rule) return;
     busy = true;
     const token = generation;
