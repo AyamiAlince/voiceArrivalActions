@@ -11,6 +11,7 @@ import { sleep } from "@utils/misc";
 import definePlugin, { OptionType } from "@utils/types";
 import { ChannelActions, ChannelStore, PermissionsBits, PermissionStore, React, RestAPI, SelectedChannelStore, showToast, UserStore, VoiceStateStore } from "@webpack/common";
 
+import { openPauseMenu } from "./pauseMenu";
 import { RulesEditor } from "./rulesEditor";
 
 export type Rule = {
@@ -22,6 +23,9 @@ export type Rule = {
 type VoiceState = { userId: string; channelId?: string | null; };
 
 export const GUILD_VOICE = 2;
+/** Stored as the pause end for rules paused until the user resumes them. */
+export const PAUSE_FOREVER = 0;
+const MAX_TIMEOUT = 2 ** 31 - 1;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const logger = new Logger("VoiceArrivalActions");
 const snowflake = /^\d{17,20}$/;
@@ -66,14 +70,103 @@ export const settings = definePluginSettings({
         component: RulesEditor,
         default: "[]",
         onChange: reset
+    },
+    pausedUntil: {
+        type: OptionType.NUMBER,
+        description: "Time (ms since epoch) until which all rules are paused. 0 means not paused.",
+        default: 0,
+        hidden: true
+    },
+    pausedRules: {
+        type: OptionType.STRING,
+        description: "JSON map of rule keys to the time their pause ends (0 = until resumed).",
+        default: "{}",
+        hidden: true
     }
 });
+
+export function ruleKey(rule: Pick<Rule, "guildId" | "userId">) {
+    return `${rule.guildId}:${rule.userId}`;
+}
+
+export function readPausedRules(text: string = settings.store.pausedRules): Record<string, number> {
+    try {
+        const value: unknown = JSON.parse(text);
+        if (value && typeof value === "object" && !Array.isArray(value))
+            return Object.fromEntries(Object.entries(value).filter(([, until]) => typeof until === "number" && Number.isFinite(until)));
+    } catch { }
+    return {};
+}
+
+/** Returns when the rule's pause ends (PAUSE_FOREVER if it has no end), or null if the rule is active. */
+export function rulePausedUntil(key: string, paused = readPausedRules(), now = Date.now()): number | null {
+    const until = paused[key];
+    if (until === undefined) return null;
+    return until === PAUSE_FOREVER || until > now ? until : null;
+}
+
+export function isPausedGlobally(now = Date.now()) {
+    return settings.store.armed && settings.store.pausedUntil > now;
+}
+
+export function formatUntil(until: number) {
+    if (until === PAUSE_FOREVER) return "until you resume it";
+    const date = new Date(until);
+    const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return date.toDateString() === new Date().toDateString()
+        ? `until ${time}`
+        : `until ${date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })} ${time}`;
+}
+
+function writePausedRules(paused: Record<string, number>) {
+    settings.store.pausedRules = JSON.stringify(paused);
+    onPauseChange();
+}
+
+export function pauseRule(key: string, until: number) {
+    writePausedRules({ ...readPausedRules(), [key]: until });
+    notify(`Rule paused ${formatUntil(until)}.`);
+}
+
+export function resumeRule(key: string) {
+    const paused = readPausedRules();
+    delete paused[key];
+    writePausedRules(paused);
+    notify("Rule resumed.");
+}
+
+/** Drops pauses of rules that no longer exist. */
+export function prunePausedRules(keys: string[]) {
+    const paused = readPausedRules();
+    const kept = Object.fromEntries(Object.entries(paused).filter(([key]) => keys.includes(key)));
+    if (Object.keys(kept).length !== Object.keys(paused).length) writePausedRules(kept);
+}
+
+export function pauseAll(ms: number) {
+    settings.store.pausedUntil = Date.now() + ms;
+    onPauseChange();
+    notify(`All rules paused ${formatUntil(settings.store.pausedUntil)}.`);
+}
+
+export function resumeAll() {
+    settings.store.pausedUntil = 0;
+    onPauseChange();
+    notify("Pause ended. Emergency exit is on.");
+}
+
+export function setArmed(armed: boolean) {
+    settings.store.armed = armed;
+    settings.store.pausedUntil = 0;
+    onPauseChange();
+    notify(armed ? "Emergency exit enabled." : "Emergency exit disabled.");
+}
 
 let active = false;
 let generation = 0;
 let busy = false;
 let previousChannel: string | null = null;
 let previousMembers = new Set<string>();
+let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 const pending = new Set<ReturnType<typeof setTimeout>>();
 
 function reset() {
@@ -82,6 +175,33 @@ function reset() {
     pending.clear();
     busy = false;
     if (active) snapshot();
+}
+
+function onPauseChange() {
+    reset();
+    scheduleExpiry();
+}
+
+/** Clears pauses that have ended and wakes up again when the next one ends. */
+function scheduleExpiry() {
+    clearTimeout(expiryTimer);
+    expiryTimer = undefined;
+    if (!active) return;
+    const now = Date.now();
+    const { pausedUntil } = settings.store;
+    if (pausedUntil !== 0 && pausedUntil <= now) {
+        settings.store.pausedUntil = 0;
+        if (settings.store.armed) notify("Pause ended. Emergency exit is on.");
+    }
+    const paused = readPausedRules();
+    const expired = Object.keys(paused).filter(key => rulePausedUntil(key, paused, now) === null);
+    if (expired.length) {
+        expired.forEach(key => delete paused[key]);
+        settings.store.pausedRules = JSON.stringify(paused);
+        reset();
+    }
+    const ends = [settings.store.pausedUntil, ...Object.values(paused)].filter(until => until > now);
+    if (ends.length) expiryTimer = setTimeout(scheduleExpiry, Math.min(Math.min(...ends) - now + 50, MAX_TIMEOUT));
 }
 
 function members(channelId: string): Set<string> {
@@ -96,6 +216,7 @@ function notify(message: string, failure = false) {
 async function act(rule: Rule, sourceId: string, targets: string[], token: number) {
     const me = UserStore.getCurrentUser()?.id;
     const stillValid = () => active && settings.store.armed && generation === token
+        && !isPausedGlobally() && rulePausedUntil(ruleKey(rule)) === null
         && SelectedChannelStore.getVoiceChannelId() === sourceId
         && members(sourceId).has(rule.userId);
     if (!me || !stillValid()) return;
@@ -108,8 +229,17 @@ async function act(rule: Rule, sourceId: string, targets: string[], token: numbe
         return;
     }
 
+    // Leaving matters more than disconnecting others, so a disconnect rule still gets you out.
+    const leaveAlone = (reason: string) => {
+        if (rule.action !== "disconnect" || !stillValid()) return false;
+        ChannelActions.selectVoiceChannel(null);
+        notify(`${reason} You left the voice channel on your own.`, true);
+        return true;
+    };
+
     if (!PermissionStore.can(PermissionsBits.MOVE_MEMBERS, source)) {
-        notify("You need the Move Members permission in this channel. Action cancelled.", true);
+        if (!leaveAlone("You don't have the Move Members permission in this channel."))
+            notify("You need the Move Members permission in this channel. Action cancelled.", true);
         return;
     }
     const destinationId = rule.action === "move" ? rule.channelId ?? null : null;
@@ -133,7 +263,8 @@ async function act(rule: Rule, sourceId: string, targets: string[], token: numbe
             if (!stillValid()) return;
             if (!members(sourceId).has(id)) break;
             if (!PermissionStore.can(PermissionsBits.MOVE_MEMBERS, source)) {
-                notify("The Move Members permission was lost. Action stopped.", true);
+                if (!leaveAlone(`The Move Members permission was lost after ${completed} members.`))
+                    notify("The Move Members permission was lost. Action stopped.", true);
                 return;
             }
             try {
@@ -150,7 +281,8 @@ async function act(rule: Rule, sourceId: string, targets: string[], token: numbe
                     continue;
                 }
                 logger.error("Failed to update voice member", error);
-                notify(`Stopped after ${completed} members: Discord rejected the request. Check permissions and channel limits.`, true);
+                if (!leaveAlone(`Discord rejected disconnecting members after ${completed}.`))
+                    notify(`Stopped after ${completed} members: Discord rejected the request. Check permissions and channel limits.`, true);
                 return;
             }
         }
@@ -175,7 +307,7 @@ function onVoiceChange() {
     previousMembers = current;
     const me = UserStore.getCurrentUser()?.id;
     // Ignore startup, reconnects and our own entry into an occupied channel.
-    if (!settings.store.armed || !channelId || !sameChannel || !me || !before.has(me) || !current.has(me) || busy) return;
+    if (!settings.store.armed || isPausedGlobally() || !channelId || !sameChannel || !me || !before.has(me) || !current.has(me) || busy) return;
     const arrivals = [...current].filter(id => id !== me && !before.has(id));
     if (!arrivals.length) return;
     const source = ChannelStore.getChannel(channelId);
@@ -183,9 +315,13 @@ function onVoiceChange() {
     let rules: Rule[];
     try { rules = parseRules(settings.store.rules); }
     catch (error) { logger.error("Invalid rules", error); return; }
-    // A server-specific rule overrides the global rule for the same user.
-    const rule = rules.find(r => r.guildId === source.guild_id && arrivals.includes(r.userId))
-        ?? rules.find(r => r.guildId === "*" && arrivals.includes(r.userId));
+    // A server-specific rule overrides the global rule for the same user, even while it is paused.
+    const effective = (r: Rule) => r.guildId === source.guild_id
+        || (r.guildId === "*" && !rules.some(s => s.guildId === source.guild_id && s.userId === r.userId));
+    const paused = readPausedRules();
+    const now = Date.now();
+    const candidates = rules.filter(r => arrivals.includes(r.userId) && effective(r) && rulePausedUntil(ruleKey(r), paused, now) === null);
+    const rule = candidates.find(r => r.guildId !== "*") ?? candidates[0];
     if (!rule) return;
     busy = true;
     const token = generation;
@@ -211,22 +347,39 @@ function EscapeIcon({ className }: { className?: string; }) {
     }));
 }
 
+function PauseIcon({ className }: { className?: string; }) {
+    return React.createElement("svg", {
+        className, width: 20, height: 20, viewBox: "0 0 24 24",
+        fill: "none", stroke: "currentColor", strokeWidth: 2, "aria-hidden": true
+    }, React.createElement("path", {
+        d: "M10 4H4v16h6M15 8v8m5-8v8"
+    }));
+}
+
 function EscapeButton({ iconForeground, hideTooltips, nameplate }: UserAreaRenderProps) {
-    const { armed } = settings.use(["armed"]);
-    const label = `Emergency exit: ${armed ? "on" : "off"}`;
-    return React.createElement(UserAreaButton, {
-        tooltipText: hideTooltips ? undefined : label,
+    const { armed, pausedUntil, pausedRules, rules: saved } = settings.use(["armed", "pausedUntil", "pausedRules", "rules"]);
+    const now = Date.now();
+    const paused = armed && pausedUntil > now;
+    let rules: Rule[] = [];
+    try { rules = parseRules(saved); } catch { }
+    const pausedMap = readPausedRules(pausedRules);
+    const pausedCount = rules.filter(rule => rulePausedUntil(ruleKey(rule), pausedMap, now) !== null).length;
+    const state = !armed ? "off"
+        : paused ? `paused ${formatUntil(pausedUntil)}`
+            : pausedCount ? `on, ${pausedCount} of ${rules.length} rules paused` : "on";
+    const label = `Emergency exit: ${state}`;
+    const button = React.createElement(UserAreaButton, {
+        tooltipText: hideTooltips ? undefined : `${label}. Right-click to pause rules.`,
         "aria-label": label,
-        icon: React.createElement(EscapeIcon, { className: iconForeground }),
+        icon: React.createElement(paused ? PauseIcon : EscapeIcon, { className: iconForeground }),
         role: "switch",
-        "aria-checked": armed,
-        redGlow: armed,
+        "aria-checked": armed && !paused,
+        redGlow: armed && !paused,
         plated: nameplate != null,
-        onClick: () => {
-            settings.store.armed = !settings.store.armed;
-            notify(settings.store.armed ? "Emergency exit enabled." : "Emergency exit disabled.");
-        }
+        onClick: () => paused ? resumeAll() : setArmed(!settings.store.armed)
     });
+    // The wrapper uses display: contents, so it does not affect the user area layout.
+    return React.createElement("span", { className: "vc-vaa-menu-anchor", onContextMenu: openPauseMenu }, button);
 }
 
 export default definePlugin({
@@ -241,12 +394,15 @@ export default definePlugin({
         busy = false;
         snapshot();
         active = true;
+        scheduleExpiry();
         VoiceStateStore.addChangeListener(onVoiceChange);
         SelectedChannelStore.addChangeListener(onVoiceChange);
     },
     stop() {
         active = false;
         generation++;
+        clearTimeout(expiryTimer);
+        expiryTimer = undefined;
         VoiceStateStore.removeChangeListener(onVoiceChange);
         SelectedChannelStore.removeChangeListener(onVoiceChange);
         pending.forEach(clearTimeout);

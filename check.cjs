@@ -21,7 +21,7 @@ const context = vm.createContext({
     setTimeout, clearTimeout,
     definePlugin: p => p,
     definePluginSettings: definitions => {
-        const values = { rules: JSON.stringify(rules), armed: false };
+        const values = { ...Object.fromEntries(Object.entries(definitions).map(([key, d]) => [key, d.default])), rules: JSON.stringify(rules), armed: false };
         return { store: new Proxy(values, {
             set(target, key, value) {
                 target[key] = value;
@@ -30,8 +30,9 @@ const context = vm.createContext({
             }
         }), use: () => values };
     },
-    React: { createElement: (type, props) => ({ type, props }) }, UserAreaButton: "button", RulesEditor() {},
-    OptionType: { BOOLEAN: 3, COMPONENT: 6 }, Logger: class { error() {} },
+    React: { createElement: (type, props, ...children) => ({ type, props, children }) }, UserAreaButton: "button", RulesEditor() {},
+    openPauseMenu() {}, openPauseAllMenu() {}, openRulePauseMenu() {},
+    OptionType: { STRING: 0, NUMBER: 1, BOOLEAN: 3, COMPONENT: 6 }, Logger: class { error() {} },
     sleep: () => Promise.resolve(), classNameFactory: prefix => name => prefix + name,
     VoiceStateStore: {
         getVoiceStatesForChannel: () => Object.fromEntries(ids.map(userId => [userId, { userId }])),
@@ -74,18 +75,20 @@ function reset(action, occupants = ["me", "other"]) {
     reset("leave"); change(["me", "other", target]); await tick();
     assert.equal(patches.length, 0); assert.deepEqual(selections, [null]);
     reset("disconnect"); admin = false; change(["me", "other", target]); await tick();
-    assert.equal(patches.length + selections.length, 0);
+    assert.equal(patches.length, 0); assert.deepEqual(selections, [null], "Disconnect without permission still leaves");
+    reset("move"); admin = false; change(["me", "other", target]); await tick();
+    assert.equal(patches.length + selections.length, 0, "Move without permission does nothing");
     reset("disconnect", ["me", target]); change(["me", target]); await tick();
     assert.equal(patches.length + selections.length, 0);
     reset("disconnect"); change(["me", "other", target]); context.plugin.stop(); await tick();
     assert.equal(patches.length + selections.length, 0);
     reset("disconnect"); reject = true; change(["me", "other", target]); await tick();
-    assert.equal(patches.length + selections.length, 0);
+    assert.equal(patches.length, 0); assert.deepEqual(selections, [null], "Rejected disconnect still leaves");
     context.plugin.stop();
     reset("disconnect"); context.plugin.settings.store.armed = false;
     change(["me", "other", target]); await tick();
     assert.equal(patches.length + selections.length, 0);
-    const button = context.plugin.userAreaButton.render({});
+    const button = context.plugin.userAreaButton.render({}).children[0];
     assert.equal(button.props["aria-checked"], false);
     button.props.onClick();
     assert.equal(context.plugin.settings.store.armed, true);
@@ -120,8 +123,47 @@ function reset(action, occupants = ["me", "other"]) {
     assert.ok(toasts.length && toasts.every(type => type === "default" || type === "critical"), "Toasts use the object API");
     context.plugin.stop();
     console.log("Global rule checks passed: matching, actual server routing, overrides and destination validation.");
+    await checkPauses(target);
     checkEditor();
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+async function checkPauses(target) {
+    const store = context.plugin.settings.store;
+    const key = `${rules[0].guildId}:${target}`;
+    reset("disconnect"); context.pauseRule(key, 0);
+    change(["me", "other", target]); await tick();
+    assert.equal(patches.length + selections.length, 0, "Paused rule does nothing");
+    context.resumeRule(key); change(["me", "other"]); change(["me", "other", target]); await tick();
+    assert.equal(patches.length, 1, "Resumed rule works again");
+    reset("disconnect"); context.pauseAll(60_000);
+    change(["me", "other", target]); await tick();
+    assert.equal(patches.length + selections.length, 0, "Global pause does nothing");
+    assert.equal(context.plugin.userAreaButton.render({}).children[0].props["aria-checked"], false);
+    context.plugin.userAreaButton.render({}).children[0].props.onClick();
+    assert.equal(store.pausedUntil, 0, "Clicking the button while paused resumes");
+    assert.equal(store.armed, true);
+    change(["me", "other"]); change(["me", "other", target]); await tick();
+    assert.equal(patches.length, 1);
+    reset("disconnect"); change(["me", "other", target]); context.pauseRule(key, Date.now() + 60_000); await tick();
+    assert.equal(patches.length + selections.length, 0, "Pausing cancels a pending action");
+    context.resumeRule(key);
+    reset("leave");
+    store.rules = JSON.stringify([{ ...rules[0], guildId: "*", action: "disconnect" }, { ...rules[0], action: "leave" }]);
+    context.pauseRule(key, 0);
+    change(["me", "other", target]); await tick();
+    assert.equal(patches.length + selections.length, 0, "Paused server rule still overrides the global rule");
+    context.resumeRule(key);
+    reset("leave"); context.pauseRule(key, Date.now() + 20);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(store.pausedRules, "{}", "Timed pauses expire by themselves");
+    context.pauseAll(-1); assert.equal(context.isPausedGlobally(), false);
+    context.pauseRule(key, 0); context.pauseRule("*:1", 0);
+    context.prunePausedRules([key]);
+    assert.deepEqual(Object.keys(JSON.parse(store.pausedRules)), [key], "Pauses of deleted rules are pruned");
+    context.resumeRule(key);
+    context.plugin.stop();
+    console.log("Pause checks passed: single rules, all rules, cancellation, overrides, expiry and pruning.");
+}
 
 function checkEditor() {
     const hooks = [];

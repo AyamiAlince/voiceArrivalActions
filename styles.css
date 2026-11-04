@@ -44,6 +44,19 @@
     box-shadow: 0 0 8px var(--status-danger);
 }
 
+.vc-vaa-armed[data-paused="true"] {
+    border-color: var(--status-warning);
+    background: color-mix(in srgb, var(--status-warning) 12%, var(--background-secondary));
+}
+
+.vc-vaa-armed[data-paused="true"] .vc-vaa-dot {
+    background: var(--status-warning);
+}
+
+.vc-vaa-menu-anchor {
+    display: contents;
+}
+
 .vc-vaa-armed-text {
     flex: 1;
     min-width: 0;
@@ -157,6 +170,16 @@
 .vc-vaa-pill[data-warning="true"] {
     color: var(--text-warning, var(--status-warning));
     background: color-mix(in srgb, var(--status-warning) 18%, transparent);
+}
+
+.vc-vaa-pill[data-paused="true"] {
+    color: var(--text-warning, var(--status-warning));
+    background: color-mix(in srgb, var(--status-warning) 18%, transparent);
+}
+
+.vc-vaa-card[data-paused="true"] .vc-vaa-avatar-wrap,
+.vc-vaa-card[data-paused="true"] .vc-vaa-summary-title {
+    opacity: 0.55;
 }
 
 .vc-vaa-body {

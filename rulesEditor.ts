@@ -9,13 +9,14 @@ import "./styles.css";
 import { Button } from "@components/Button";
 import { classNameFactory } from "@utils/css";
 import { ChannelStore, GuildChannelStore, GuildMemberStore, GuildStore, IconUtils, React, UserStore, UserUtils, useStateFromStores } from "@webpack/common";
-import type { ChangeEvent, FocusEvent, KeyboardEvent, ReactNode } from "react";
+import type { ChangeEvent, FocusEvent, KeyboardEvent, MouseEvent, ReactNode } from "react";
 
-import { GUILD_VOICE, isSnowflake, parseRules, Rule, settings } from ".";
+import { formatUntil, GUILD_VOICE, isSnowflake, parseRules, prunePausedRules, readPausedRules, resumeAll, resumeRule, Rule, ruleKey, rulePausedUntil, setArmed, settings } from ".";
+import { openPauseAllMenu, openRulePauseMenu } from "./pauseMenu";
 
 const cl = classNameFactory("vc-vaa-");
 const MAX_SHOWN = 50;
-const EDITOR_KEYS: ("rules" | "armed")[] = ["rules", "armed"];
+const EDITOR_KEYS: ("rules" | "armed" | "pausedUntil" | "pausedRules")[] = ["rules", "armed", "pausedUntil", "pausedRules"];
 
 type Choice = { value: string; label: string; note?: string; icon?: string; fallback?: string; round?: boolean; };
 type UserLike = { id: string; username: string; globalName?: string | null; };
@@ -112,8 +113,8 @@ function Step({ number, title, hint, children }: { number: number; title: string
         hint ? h("div", { className: cl("hint") }, hint) : null);
 }
 
-function RuleCard({ rule, index, update, remove }: {
-    rule: Rule; index: number; update: (next: Rule) => void; remove: () => void;
+function RuleCard({ rule, index, update, remove, pausedUntil }: {
+    rule: Rule; index: number; update: (next: Rule) => void; remove: () => void; pausedUntil: number | null;
 }) {
     const h = React.createElement;
     const [expanded, setExpanded] = React.useState(() => !rule.userId || !rule.guildId);
@@ -150,13 +151,19 @@ function RuleCard({ rule, index, update, remove }: {
                 serverChoice ? ` in ${serverChoice.label}` : "",
                 h("span", { className: cl("pill"), "data-action": rule.action }, `${action.emoji} ${action.title}`),
                 rule.action === "move" && channelChoice ? h("span", { className: cl("pill") }, `🔊 ${channelChoice.label}`) : null,
-                incomplete ? h("span", { className: cl("pill"), "data-warning": true }, "Incomplete") : null)),
+                incomplete ? h("span", { className: cl("pill"), "data-warning": true }, "Incomplete") : null,
+                pausedUntil !== null ? h("span", { className: cl("pill"), "data-paused": true }, `⏸ Paused ${formatUntil(pausedUntil)}`) : null)),
+        // Pausing applies right away and does not need saving.
+        incomplete ? null : pausedUntil !== null
+            ? h(Button, { variant: "primary", size: "small", onClick: () => resumeRule(ruleKey(rule)) }, "Resume")
+            : h(Button, { variant: "secondary", size: "small", onClick: (event: MouseEvent) => openRulePauseMenu(event, ruleKey(rule)) }, "Pause"),
         h(Button, { variant: "secondary", size: "small", onClick: () => setExpanded(!expanded), "aria-expanded": expanded }, expanded ? "Done" : "Edit"),
         h(Button, { variant: "dangerSecondary", size: "small", onClick: remove, "aria-label": `Remove rule ${index + 1}` }, "Remove"));
 
-    if (!expanded) return h("div", { className: cl("card") }, summary);
+    const paused = pausedUntil !== null;
+    if (!expanded) return h("div", { className: cl("card"), "data-paused": paused }, summary);
 
-    return h("div", { className: cl("card") }, summary,
+    return h("div", { className: cl("card"), "data-paused": paused }, summary,
         h("div", { className: cl("body") },
             h(Step, { number: 1, title: "Who are you avoiding?", hint: "Search loaded members by name or paste a user ID." },
                 h(Picker, {
@@ -208,7 +215,10 @@ function RuleCard({ rule, index, update, remove }: {
 export function RulesEditor() {
     // Discord's React export is only available after webpack initialization.
     const h = React.createElement;
-    const { rules: saved, armed } = settings.use(EDITOR_KEYS);
+    const { rules: saved, armed, pausedUntil, pausedRules } = settings.use(EDITOR_KEYS);
+    const now = Date.now();
+    const globallyPaused = armed && pausedUntil > now;
+    const pausedMap = readPausedRules(pausedRules);
     const [draft, setDraft] = React.useState<DraftRule[]>(() => {
         try { return toDraft(parseRules(saved)); } catch { return []; }
     });
@@ -232,20 +242,27 @@ export function RulesEditor() {
                 }
             }
             settings.store.rules = JSON.stringify(validated);
+            prunePausedRules(validated.map(ruleKey));
             setError(""); setStatus("Rules saved.");
         } catch (err) { setError(err instanceof Error ? err.message : String(err)); setStatus(""); }
     }
     const addRule = () => change([...draft, { key: nextKey++, rule: { guildId: "", userId: "", action: "leave" } }]);
 
     return h("section", { className: cl("editor"), "aria-label": "Server rules" },
-        h("div", { className: cl("armed"), "data-on": armed },
+        h("div", { className: cl("armed"), "data-on": armed && !globallyPaused, "data-paused": globallyPaused },
             h("span", { className: cl("dot"), "aria-hidden": true }),
             h("div", { className: cl("armed-text") },
-                h("div", { className: cl("armed-title") }, armed ? "Emergency exit is on" : "Emergency exit is off"),
-                h("div", { className: cl("hint") }, armed
-                    ? "Saved rules run automatically when the person joins your voice channel."
-                    : "Rules do nothing until this is on. You can also toggle it with the exit button next to your microphone.")),
-            h(Button, { variant: armed ? "dangerSecondary" : "primary", size: "small", onClick: () => { settings.store.armed = !armed; } }, armed ? "Turn off" : "Turn on")),
+                h("div", { className: cl("armed-title") }, !armed ? "Emergency exit is off" : globallyPaused ? "Emergency exit is paused" : "Emergency exit is on"),
+                h("div", { className: cl("hint") }, !armed
+                    ? "Rules do nothing until this is on. You can also toggle it with the exit button next to your microphone."
+                    : globallyPaused
+                        ? `All rules are paused ${formatUntil(pausedUntil)} and turn back on by themselves.`
+                        : "Saved rules run automatically when the person joins your voice channel."),
+                h("div", { className: cl("hint") }, "Right-click the exit button next to your microphone to pause all or single rules at any time.")),
+            globallyPaused
+                ? h(Button, { variant: "primary", size: "small", onClick: resumeAll }, "Resume now")
+                : armed ? h(Button, { variant: "secondary", size: "small", onClick: (event: MouseEvent) => openPauseAllMenu(event) }, "Pause…") : null,
+            h(Button, { variant: armed ? "dangerSecondary" : "primary", size: "small", onClick: () => setArmed(!armed) }, armed ? "Turn off" : "Turn on")),
         !draft.length
             ? h("div", { className: cl("empty") },
                 h("div", { className: cl("empty-emoji"), "aria-hidden": true }, "🏃"),
@@ -253,6 +270,7 @@ export function RulesEditor() {
                 h("div", { className: cl("hint") }, "Add a rule, pick a person and choose what happens when they join your voice channel."))
             : h("div", { className: cl("list") }, ...draft.map((item, index) => h(RuleCard, {
                 key: item.key, rule: item.rule, index,
+                pausedUntil: rulePausedUntil(ruleKey(item.rule), pausedMap, now),
                 update: next => change(draft.map(d => d.key === item.key ? { key: d.key, rule: next } : d)),
                 remove: () => change(draft.filter(d => d.key !== item.key))
             }))),
