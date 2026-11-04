@@ -50,7 +50,7 @@ const context = vm.createContext({
             patches.push(request);
         }
     },
-    showToast: (message, type) => toasts.push(type)
+    showToast: ({ text, variant }) => toasts.push(typeof text === "string" ? variant : "invalid")
 });
 vm.runInContext(stripTypeScriptTypes(source), context);
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
@@ -117,7 +117,7 @@ function reset(action, occupants = ["me", "other"]) {
     reset("disconnect"); rateLimits = 2; change(["me", "other", target]); await tick();
     assert.equal(patches.length, 1, "Rate limited requests are retried");
     assert.deepEqual(selections, [null]);
-    assert.ok(toasts.length && toasts.every(type => type === "message" || type === "failure"), "Toasts use Discord's string types");
+    assert.ok(toasts.length && toasts.every(type => type === "default" || type === "critical"), "Toasts use the object API");
     context.plugin.stop();
     console.log("Global rule checks passed: matching, actual server routing, overrides and destination validation.");
     checkEditor();

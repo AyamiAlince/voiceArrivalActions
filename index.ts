@@ -90,7 +90,7 @@ function members(channelId: string): Set<string> {
 }
 
 function notify(message: string, failure = false) {
-    showToast(`VoiceArrivalActions: ${message}`, failure ? "failure" : "message");
+    showToast({ text: `VoiceArrivalActions: ${message}`, variant: failure ? "critical" : "default" });
 }
 
 async function act(rule: Rule, sourceId: string, targets: string[], token: number) {
